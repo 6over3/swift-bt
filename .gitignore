@@ -1,0 +1,31 @@
+# Swift Package Manager
+.build/
+.build-*/
+.swiftpm/
+
+# Xcode
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+
+# Swift playgrounds
+timeline.xctimeline
+playground.xcworkspace/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Local environment and coverage output
+.env
+.env.*
+!.env.example
+*.profdata
+*.profraw
