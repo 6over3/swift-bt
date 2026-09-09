@@ -101,6 +101,49 @@ func reusableSubtreesPreserveBoundariesAndParentScopedIdentity() throws {
 }
 
 @Test
+func dynamicSubtreesDeclareTheirTemplateAndRoundTrip() throws {
+  let template = BehaviorTreeReference(name: "image-region", version: "3")
+  let tree = try BehaviorTree<TestAction, TestCondition>(name: "pipeline") {
+    DynamicSubtrees(
+      using: template,
+      discover: .validate,
+      start: .analyze,
+      await: .publish,
+      named: "Process regions",
+      attributes: ["source": .string("image-analysis")]
+    )
+  }
+
+  let definition = tree.definition(actionName: { $0.rawValue })
+  #expect(definition.root.kind == .dynamicSubtrees)
+  #expect(definition.root.label == "Process regions")
+  #expect(definition.root.children.count == 4)
+  #expect(definition.root.children[0].role == .discovery)
+  #expect(definition.root.children[0].label == "Find items")
+  #expect(definition.root.children[1].role == .start)
+  #expect(definition.root.children[1].label == "Start processing")
+  #expect(definition.root.children[2].role == .completion)
+  #expect(definition.root.children[2].label == "Wait for completion")
+  let templateChild = definition.root.children[3]
+  #expect(templateChild.role == .template)
+  #expect(templateChild.kind == .subtree)
+  #expect(templateChild.label == "image-region")
+  #expect(templateChild.attributes["treeName"] == .string("image-region"))
+  #expect(templateChild.attributes["treeVersion"] == .string("3"))
+  #expect(definition.root.attributes["source"] == .string("image-analysis"))
+  #expect(definition.root.attributes["templateTreeName"] == .string("image-region"))
+  #expect(definition.root.attributes["templateTreeVersion"] == .string("3"))
+  #expect(definition.graphviz().contains("shape=folder"))
+
+  let data = try JSONEncoder().encode(tree)
+  let decoded = try JSONDecoder().decode(
+    BehaviorTree<TestAction, TestCondition>.self,
+    from: data
+  )
+  #expect(decoded == tree)
+}
+
+@Test
 func validationRejectsInvalidRetryAndEmptyComposite() {
   #expect(throws: BehaviorTreeValidationError.self) {
     try BehaviorTree<TestAction, TestCondition>(name: "invalid") {

@@ -17,13 +17,16 @@ public struct BehaviorTreeView: View {
   @Environment(\.behaviorTreeViewConfiguration) private var configuration
   @Environment(\.behaviorTreeViewTheme) private var theme
   @State private var generatedDiagram: BehaviorTreeDiagram?
+  @State private var diagramFailure: BehaviorTreeDiagramError?
   @State private var liveSnapshot: BehaviorVisualizationSnapshot?
+  @State private var internalSelection: BehaviorNodeID?
 
   private let definition: BehaviorTreeDefinition
   private let preparedDiagram: BehaviorTreeDiagram?
   private let snapshot: BehaviorVisualizationSnapshot?
   private let visualization: BehaviorVisualizationStore?
   private let layout: BehaviorTreeDiagramLayout
+  private let selection: Binding<BehaviorNodeID?>?
 
   /// Creates a view driven by snapshots supplied by its parent.
   public init(
@@ -36,6 +39,22 @@ public struct BehaviorTreeView: View {
     self.snapshot = snapshot
     visualization = nil
     self.layout = layout
+    selection = nil
+  }
+
+  /// Creates a view driven by snapshots while exposing node selection.
+  public init(
+    definition: BehaviorTreeDefinition,
+    snapshot: BehaviorVisualizationSnapshot? = nil,
+    selection: Binding<BehaviorNodeID?>,
+    layout: BehaviorTreeDiagramLayout = .init()
+  ) {
+    self.definition = definition
+    preparedDiagram = nil
+    self.snapshot = snapshot
+    visualization = nil
+    self.layout = layout
+    self.selection = selection
   }
 
   /// Creates a view from a precomputed diagram and an optional snapshot.
@@ -48,6 +67,7 @@ public struct BehaviorTreeView: View {
     self.snapshot = snapshot
     visualization = nil
     layout = .init()
+    selection = nil
   }
 
   /// Creates a self-updating view backed by a visualization store.
@@ -60,6 +80,7 @@ public struct BehaviorTreeView: View {
     snapshot = nil
     self.visualization = visualization
     self.layout = layout
+    selection = nil
   }
 
   /// Creates a self-updating view with a precomputed diagram.
@@ -73,6 +94,7 @@ public struct BehaviorTreeView: View {
     snapshot = nil
     self.visualization = visualization
     layout = .init()
+    selection = nil
   }
 
   public var body: some View {
@@ -88,7 +110,9 @@ public struct BehaviorTreeView: View {
     BehaviorTreeViewContent(
       definition: definition,
       diagram: activeDiagram,
+      diagramFailure: diagramFailure,
       snapshot: activeSnapshot,
+      selection: selection ?? $internalSelection,
       configuration: configuration,
       theme: theme
     )
@@ -104,11 +128,22 @@ public struct BehaviorTreeView: View {
     guard preparedDiagram == nil else { return }
     let definition = definition
     let layout = layout
-    let diagram = await Task.detached(priority: .userInitiated) {
-      BehaviorTreeDiagram(definition: definition, layout: layout)
-    }.value
-    guard !Task.isCancelled else { return }
-    generatedDiagram = diagram
+    do {
+      let diagram = try await Task.detached(priority: .userInitiated) {
+        try BehaviorTreeDiagram(definition: definition, layout: layout)
+      }.value
+      guard !Task.isCancelled else { return }
+      generatedDiagram = diagram
+      diagramFailure = nil
+    } catch is CancellationError {
+      return
+    } catch let error as BehaviorTreeDiagramError {
+      guard !Task.isCancelled else { return }
+      diagramFailure = error
+    } catch {
+      guard !Task.isCancelled else { return }
+      diagramFailure = .layoutFailed(String(describing: error))
+    }
   }
 
   private func observeVisualizationIfNeeded() async {
@@ -125,9 +160,15 @@ private struct DiagramTaskID: Hashable {
   let layout: BehaviorTreeDiagramLayout
 }
 
+private struct SelectionFocusRequest: Hashable {
+  let definition: BehaviorTreeDefinition
+  let selectedNodeID: BehaviorNodeID?
+  let isEnabled: Bool
+}
+
 private struct BehaviorTreeViewport: Equatable {
   var offset = CGSize.zero
-  var zoom: CGFloat = 1
+  var scale: CGFloat
 }
 
 private struct BehaviorTreeViewContent: View {
@@ -135,12 +176,14 @@ private struct BehaviorTreeViewContent: View {
 
   let definition: BehaviorTreeDefinition
   let diagram: BehaviorTreeDiagram?
+  let diagramFailure: BehaviorTreeDiagramError?
   let snapshot: BehaviorVisualizationSnapshot?
+  @Binding var selectedNodeID: BehaviorNodeID?
   let configuration: BehaviorTreeViewConfiguration
   let theme: BehaviorTreeViewTheme
 
-  @State private var viewport = BehaviorTreeViewport()
-  @State private var selectedNodeID: BehaviorNodeID?
+  @State private var viewport = BehaviorTreeViewport(scale: 1)
+  @State private var viewportDefinition: BehaviorTreeDefinition?
   @State private var pulsedNodeID: BehaviorNodeID?
   @State private var eventPulse: CGFloat = 0
   @GestureState private var dragTranslation = CGSize.zero
@@ -151,21 +194,34 @@ private struct BehaviorTreeViewContent: View {
   init(
     definition: BehaviorTreeDefinition,
     diagram: BehaviorTreeDiagram?,
+    diagramFailure: BehaviorTreeDiagramError?,
     snapshot: BehaviorVisualizationSnapshot?,
+    selection: Binding<BehaviorNodeID?>,
     configuration: BehaviorTreeViewConfiguration,
     theme: BehaviorTreeViewTheme
   ) {
     self.definition = definition
     self.diagram = diagram
+    self.diagramFailure = diagramFailure
     self.snapshot = snapshot
+    _selectedNodeID = selection
     self.configuration = configuration
     self.theme = theme
+    _viewport = State(
+      initialValue: BehaviorTreeViewport(scale: configuration.initialZoom)
+    )
   }
 
   var body: some View {
     GeometryReader { geometry in
       if let diagram {
         interactiveDiagram(diagram, in: geometry.size)
+      } else if let diagramFailure {
+        ContentUnavailableView(
+          "Unable to lay out behavior tree",
+          systemImage: "exclamationmark.triangle",
+          description: Text(String(describing: diagramFailure))
+        )
       } else {
         ProgressView()
           .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -175,16 +231,16 @@ private struct BehaviorTreeViewContent: View {
     .background(theme.backgroundColor)
     .clipped()
     .onChange(of: diagram?.definition) {
-      viewport = BehaviorTreeViewport()
-      selectedNodeID = nil
+      viewport = BehaviorTreeViewport(scale: configuration.initialZoom)
+      if let selectedNodeID,
+        definition.node(identifiedBy: selectedNodeID) == nil
+      {
+        self.selectedNodeID = nil
+      }
     }
     .task(id: snapshot?.sequence) {
       await animateLatestEvent()
     }
-    .animation(
-      reduceMotion ? nil : .smooth(duration: 0.28),
-      value: snapshot
-    )
   }
 
   @ViewBuilder
@@ -193,6 +249,32 @@ private struct BehaviorTreeViewContent: View {
     in size: CGSize
   ) -> some View {
     diagramCanvas(diagram, in: size)
+      .task(id: diagram.definition) {
+        positionInitialViewport(for: diagram)
+      }
+      .task(
+        id: SelectionFocusRequest(
+          definition: diagram.definition,
+          selectedNodeID: selectedNodeID,
+          isEnabled: configuration.centersSelection
+        )
+      ) {
+        centerSelectionIfNeeded(in: diagram, size: size)
+      }
+  }
+
+  private func positionInitialViewport(for diagram: BehaviorTreeDiagram) {
+    guard viewportDefinition != diagram.definition,
+      let root = diagram.nodes.first(where: { $0.id == diagram.definition.root.id })
+    else { return }
+    viewport = BehaviorTreeViewport(
+      offset: CGSize(
+        width: (diagram.contentBounds.midX - root.frame.midX) * configuration.initialZoom,
+        height: (diagram.contentBounds.midY - root.frame.midY) * configuration.initialZoom
+      ),
+      scale: configuration.initialZoom
+    )
+    viewportDefinition = diagram.definition
   }
 
   private func diagramCanvas(
@@ -225,6 +307,8 @@ private struct BehaviorTreeViewContent: View {
       .overlay(alignment: .topTrailing) {
         BehaviorTreeViewportControls(
           viewport: $viewport,
+          currentScale: transform.scale,
+          fitScale: fitScale(for: diagram, in: size),
           configuration: configuration
         )
         .padding(10)
@@ -269,13 +353,13 @@ private struct BehaviorTreeViewContent: View {
         .gesture(panGesture, isEnabled: configuration.isPanEnabled)
         #if os(macOS) || os(iOS) || os(visionOS)
           .simultaneousGesture(
-            zoomGesture,
+            zoomGesture(diagram, in: size),
             isEnabled: configuration.isZoomEnabled
           )
         #endif
         .simultaneousGesture(
           selectionGesture(diagram, in: size),
-          isEnabled: configuration.isInspectorVisible
+          isEnabled: configuration.isSelectionEnabled
         )
     #endif
   }
@@ -294,13 +378,16 @@ private struct BehaviorTreeViewContent: View {
   #endif
 
   #if !os(tvOS) && !os(watchOS)
-    private var zoomGesture: some Gesture {
+    private func zoomGesture(
+      _ diagram: BehaviorTreeDiagram,
+      in size: CGSize
+    ) -> some Gesture {
       MagnifyGesture()
         .updating($gestureMagnification) { value, state, _ in
           state = value.magnification
         }
         .onEnded { value in
-          viewport.zoom = clampedZoom(viewport.zoom * value.magnification)
+          viewport.scale = clampedScale(viewport.scale * value.magnification)
         }
     }
   #endif
@@ -317,7 +404,10 @@ private struct BehaviorTreeViewContent: View {
             diagram: diagram,
             in: size
           )
-          selectedNodeID = diagram.nodes.last { $0.frame.contains(point) }?.id
+          guard let node = diagram.nodes.last(where: { $0.frame.contains(point) }) else {
+            return
+          }
+          selectedNodeID = node.id
         }
     }
   #endif
@@ -326,33 +416,58 @@ private struct BehaviorTreeViewContent: View {
     for diagram: BehaviorTreeDiagram,
     in size: CGSize
   ) -> BehaviorTreeCanvasTransform {
-    let bounds = diagram.contentBounds
     guard size.width > 0, size.height > 0 else {
       return BehaviorTreeCanvasTransform(scale: 1, offset: .zero)
     }
-    let availableWidth = max(1, size.width - 96)
-    let availableHeight = max(1, size.height - 128)
-    let fitScale = min(
-      1,
-      min(availableWidth / bounds.width, availableHeight / bounds.height)
-    )
+    let baseScale = viewport.scale
     #if !os(tvOS) && !os(watchOS)
       let gestureZoom = gestureMagnification
     #else
       let gestureZoom: CGFloat = 1
     #endif
-    let zoom =
+    let proposedScale = baseScale * gestureZoom
+    let scale =
       configuration.isZoomEnabled
-      ? clampedZoom(viewport.zoom * gestureZoom)
-      : 1
+      ? clampedScale(proposedScale)
+      : baseScale
     let drag = configuration.isPanEnabled ? dragTranslation : .zero
     let storedOffset = configuration.isPanEnabled ? viewport.offset : .zero
     return BehaviorTreeCanvasTransform(
-      scale: fitScale * zoom,
+      scale: scale,
       offset: CGSize(
         width: storedOffset.width + drag.width,
         height: storedOffset.height + drag.height
       )
+    )
+  }
+
+  private func fitScale(
+    for diagram: BehaviorTreeDiagram,
+    in size: CGSize
+  ) -> CGFloat {
+    let availableWidth = max(1, size.width - 96)
+    let availableHeight = max(1, size.height - 128)
+    return min(
+      1,
+      min(
+        availableWidth / diagram.contentBounds.width,
+        availableHeight / diagram.contentBounds.height
+      )
+    )
+  }
+
+  private func centerSelectionIfNeeded(
+    in diagram: BehaviorTreeDiagram,
+    size: CGSize
+  ) {
+    guard configuration.centersSelection,
+      let selectedNodeID,
+      let node = diagram.nodes.first(where: { $0.id == selectedNodeID })
+    else { return }
+    let scale = viewport.scale
+    viewport.offset = CGSize(
+      width: (diagram.contentBounds.midX - node.frame.midX) * scale,
+      height: (diagram.contentBounds.midY - node.frame.midY) * scale
     )
   }
 
@@ -370,7 +485,7 @@ private struct BehaviorTreeViewContent: View {
     )
   }
 
-  private func clampedZoom(_ proposed: CGFloat) -> CGFloat {
+  private func clampedScale(_ proposed: CGFloat) -> CGFloat {
     min(configuration.maximumZoom, max(configuration.minimumZoom, proposed))
   }
 
@@ -561,6 +676,9 @@ private struct BehaviorTreeCanvas: View, Animatable {
       y: -diagram.contentBounds.midY
     )
 
+    for group in diagram.groups where group.frame.intersects(visibleBounds) {
+      draw(group, in: &context)
+    }
     for edge in diagram.edges where edge.bounds.intersects(visibleBounds) {
       draw(edge, frontier: frontier, in: &context)
     }
@@ -606,49 +724,43 @@ private struct BehaviorTreeCanvas: View, Animatable {
   }
 
   private func draw(
+    _ group: BehaviorTreeDiagramGroup,
+    in context: inout GraphicsContext
+  ) {
+    let dash: [CGFloat] =
+      switch group.kind {
+      case .execution: [7, 5]
+      case .parallel: []
+      case .decision: [3, 3]
+      case .loop: [10, 4]
+      case .fanOut: [2, 4]
+      }
+    let shape = Path(roundedRect: group.frame, cornerRadius: 18)
+    context.fill(shape, with: .color(theme.executionGroupFillColor))
+    context.stroke(
+      shape,
+      with: .color(theme.executionGroupBorderColor),
+      style: StrokeStyle(lineWidth: 1, dash: dash)
+    )
+    var label = context.resolve(Text(verbatim: group.label).font(.caption.weight(.medium)))
+    label.shading = .color(theme.executionGroupTextColor)
+    context.draw(
+      label,
+      at: CGPoint(x: group.frame.minX + 14, y: group.frame.minY + 10),
+      anchor: .leading
+    )
+  }
+
+  private func draw(
     _ edge: BehaviorTreeDiagramEdge,
     frontier: Set<BehaviorNodeID>,
     in context: inout GraphicsContext
   ) {
+    let isSearchRelevant = searchIncludes(edge.parentID) || searchIncludes(edge.childID)
     var path = Path()
-    path.move(to: edge.start)
-    let rolePosition: CGPoint
-    switch diagram.layout.direction {
-    case .topDown:
-      let distance = edge.end.y - edge.start.y
-      path.addCurve(
-        to: edge.end,
-        control1: CGPoint(
-          x: edge.start.x,
-          y: edge.start.y + distance * 0.45
-        ),
-        control2: CGPoint(
-          x: edge.end.x,
-          y: edge.end.y - distance * 0.45
-        )
-      )
-      rolePosition = CGPoint(
-        x: (edge.start.x + edge.end.x) / 2,
-        y: (edge.start.y + edge.end.y) / 2 - 7
-      )
-    case .leftToRight:
-      let distance = edge.end.x - edge.start.x
-      path.addCurve(
-        to: edge.end,
-        control1: CGPoint(
-          x: edge.start.x + distance * 0.45,
-          y: edge.start.y
-        ),
-        control2: CGPoint(
-          x: edge.end.x - distance * 0.45,
-          y: edge.end.y
-        )
-      )
-      rolePosition = CGPoint(
-        x: (edge.start.x + edge.end.x) / 2,
-        y: (edge.start.y + edge.end.y) / 2 - 8
-      )
-    }
+    guard let first = edge.points.first else { return }
+    path.move(to: first)
+    for point in edge.points.dropFirst() { path.addLine(to: point) }
     guard let childIndex = diagram.nodeIndexByID[edge.childID] else { return }
     for status in BehaviorTreeCanvasAnimation.statuses {
       let weight = statusWeight(status, nodeIndex: childIndex)
@@ -656,7 +768,7 @@ private struct BehaviorTreeCanvas: View, Animatable {
       let color =
         status == .idle
         ? theme.edgeColor
-        : theme.nodeStyle(for: status).borderColor
+        : renderedStyle(for: status, nodeID: edge.childID).borderColor
       let lineWidth: CGFloat
       if status == .running {
         lineWidth =
@@ -667,7 +779,7 @@ private struct BehaviorTreeCanvas: View, Animatable {
         lineWidth = status == .idle ? 1 : 1.25
       }
       context.drawLayer { layer in
-        layer.opacity = weight
+        layer.opacity = weight * (isSearchRelevant ? 1 : 0.16)
         layer.stroke(
           path,
           with: .color(color),
@@ -675,21 +787,68 @@ private struct BehaviorTreeCanvas: View, Animatable {
             lineWidth: lineWidth,
             lineCap: .round,
             lineJoin: .round,
-            dash: status == .skipped || status == .cancelled ? [6, 4] : []
+            dash: status == .skipped || status == .cancelled || edge.kind == .auxiliary
+              ? [6, 4] : []
           )
         )
+        if edge.kind != .auxiliary, let marker = flowMarker(for: edge) {
+          layer.fill(marker, with: .color(color))
+        }
       }
     }
     guard configuration.details.contains(.edgeRoles),
-      let role = childRoleLabel(edge.childRole)
+      let role = edge.label,
+      let rolePosition = edge.labelPosition
     else { return }
     var label = context.resolve(Text(verbatim: role).font(.caption2))
     label.shading = .color(theme.edgeTextColor)
+    let measured = label.measure(in: CGSize(width: 180, height: 40))
+    let background = CGRect(
+      x: rolePosition.x - measured.width / 2 - 5,
+      y: rolePosition.y - measured.height / 2 - 3,
+      width: measured.width + 10,
+      height: measured.height + 6
+    )
+    context.fill(
+      Path(roundedRect: background, cornerRadius: 5),
+      with: .color(.primary.opacity(0.12))
+    )
     context.draw(
       label,
       at: rolePosition,
       anchor: .center
     )
+  }
+
+  private func flowMarker(for edge: BehaviorTreeDiagramEdge) -> Path? {
+    guard let end = edge.points.last,
+      let previous = edge.points.dropLast().last
+    else { return nil }
+    let delta = CGVector(dx: end.x - previous.x, dy: end.y - previous.y)
+    let length = hypot(delta.dx, delta.dy)
+    guard length > 0 else { return nil }
+    let direction = CGVector(dx: delta.dx / length, dy: delta.dy / length)
+    let perpendicular = CGVector(dx: -direction.dy, dy: direction.dx)
+    let base = CGPoint(
+      x: end.x - direction.dx * 7,
+      y: end.y - direction.dy * 7
+    )
+    var marker = Path()
+    marker.move(to: end)
+    marker.addLine(
+      to: CGPoint(
+        x: base.x + perpendicular.dx * 3.5,
+        y: base.y + perpendicular.dy * 3.5
+      )
+    )
+    marker.addLine(
+      to: CGPoint(
+        x: base.x - perpendicular.dx * 3.5,
+        y: base.y - perpendicular.dy * 3.5
+      )
+    )
+    marker.closeSubpath()
+    return marker
   }
 
   private func draw(
@@ -701,13 +860,14 @@ private struct BehaviorTreeCanvas: View, Animatable {
   ) {
     let state = snapshot?.nodes[node.id]
     let status = dominantStatus(nodeIndex: nodeIndex)
-    let style = theme.nodeStyle(for: status)
+    let style = renderedStyle(for: status, nodeID: node.id)
     let path = Path(roundedRect: node.frame, cornerRadius: 12)
     let isReactive = node.attributes["memory"] == .string("reactive")
+    let searchOpacity: Double = searchIncludes(node.id) ? 1 : 0.18
     for candidate in BehaviorTreeCanvasAnimation.statuses {
       let weight = statusWeight(candidate, nodeIndex: nodeIndex)
       guard weight > 0.001 else { continue }
-      let candidateStyle = theme.nodeStyle(for: candidate)
+      let candidateStyle = renderedStyle(for: candidate, nodeID: node.id)
       let lineWidth =
         candidate == .running
         ? (frontier.contains(node.id)
@@ -715,7 +875,7 @@ private struct BehaviorTreeCanvas: View, Animatable {
         : 1
       let isDashed = candidate == .skipped || candidate == .cancelled || isReactive
       context.drawLayer { layer in
-        layer.opacity = weight
+        layer.opacity = weight * searchOpacity
         layer.fill(path, with: .color(candidateStyle.fillColor))
         layer.stroke(
           path,
@@ -742,6 +902,13 @@ private struct BehaviorTreeCanvas: View, Animatable {
         lineWidth: max(2, theme.runningLineWidth)
       )
     }
+    if configuration.highlightedNodeIDs?.contains(node.id) == true {
+      context.stroke(
+        Path(roundedRect: node.frame.insetBy(dx: -3, dy: -3), cornerRadius: 15),
+        with: .color(.accentColor.opacity(0.72)),
+        lineWidth: 2
+      )
+    }
 
     if node.kind == .subtree {
       context.stroke(
@@ -758,6 +925,11 @@ private struct BehaviorTreeCanvas: View, Animatable {
       style: style,
       in: &context
     )
+  }
+
+  private func searchIncludes(_ nodeID: BehaviorNodeID) -> Bool {
+    guard let highlightedNodeIDs = configuration.highlightedNodeIDs else { return true }
+    return highlightedNodeIDs.contains(nodeID)
   }
 
   private func drawNodeEmphasis(
@@ -795,7 +967,7 @@ private struct BehaviorTreeCanvas: View, Animatable {
       return parts.joined(separator: " · ")
     }
     if configuration.details.contains(.status) {
-      parts.append(state.status.rawValue.capitalized)
+      parts.append(nodeStatusLabel(node, state: state))
     }
     if configuration.details.contains(.attempt), let attempt = state.attempt {
       parts.append("attempt \(attempt)")
@@ -846,7 +1018,7 @@ private struct BehaviorTreeCanvas: View, Animatable {
     let textX = node.frame.minX + 42
     let textWidth = node.frame.maxX - textX - 28
     var label = context.resolve(
-      Text(verbatim: abbreviated(node.label, limit: 30))
+      Text(verbatim: abbreviated(node.label, limit: 42))
         .font(.caption.weight(.semibold))
     )
     label.shading = .color(style.textColor)
@@ -854,9 +1026,9 @@ private struct BehaviorTreeCanvas: View, Animatable {
       label,
       in: CGRect(
         x: textX,
-        y: node.frame.minY + 10,
+        y: node.frame.minY + 8,
         width: textWidth,
-        height: 20
+        height: 26
       )
     )
 
@@ -869,7 +1041,7 @@ private struct BehaviorTreeCanvas: View, Animatable {
       detail,
       in: CGRect(
         x: textX,
-        y: node.frame.minY + 34,
+        y: node.frame.minY + 38,
         width: textWidth,
         height: 18
       )
@@ -932,7 +1104,7 @@ private struct BehaviorTreeCanvas: View, Animatable {
         Text(Image(systemName: symbol))
           .font(.caption2.weight(.bold))
       )
-      badge.shading = .color(theme.nodeStyle(for: status).borderColor)
+      badge.shading = .color(renderedStyle(for: status, nodeID: nodeID(at: nodeIndex)).borderColor)
       context.drawLayer { layer in
         layer.opacity = weight
         layer.draw(
@@ -956,6 +1128,57 @@ private struct BehaviorTreeCanvas: View, Animatable {
       + nodeIndex * BehaviorTreeCanvasAnimation.nodeStride
       + statusIndex
     return min(1, max(0, canvasAnimation.value(at: index)))
+  }
+
+  private func nodeID(at index: Int) -> BehaviorNodeID {
+    diagram.nodes[index].id
+  }
+
+  private func renderedStyle(
+    for status: BehaviorVisualizationStatus,
+    nodeID: BehaviorNodeID
+  ) -> BehaviorTreeViewNodeStyle {
+    if let index = diagram.nodeIndexByID[nodeID], diagram.nodes.indices.contains(index) {
+      let node = diagram.nodes[index]
+      if status == .failed, isDecisionCondition(node) { return theme.noResult }
+      if status == .succeeded,
+        snapshot?.nodes[nodeID]?.inspection?.outcome == nil,
+        node.kind.isControlFlow
+      {
+        return theme.completed
+      }
+    }
+    return theme.nodeStyle(
+      for: status,
+      inspectionOutcome: snapshot?.nodes[nodeID]?.inspection?.outcome
+    )
+  }
+
+  private func isDecisionCondition(_ node: BehaviorTreeDiagramNode) -> Bool {
+    guard node.kind == .condition,
+      let parentID = node.parentID,
+      let parentIndex = diagram.nodeIndexByID[parentID],
+      diagram.nodes.indices.contains(parentIndex)
+    else { return false }
+    let parent = diagram.nodes[parentIndex]
+    return parent.kind == .branch || parent.kind == .precondition || parent.kind == .loop
+  }
+
+  private func nodeStatusLabel(
+    _ node: BehaviorTreeDiagramNode,
+    state: BehaviorNodeVisualizationState
+  ) -> String {
+    if state.status == .failed, isDecisionCondition(node) { return "False" }
+    if state.status == .succeeded {
+      switch state.inspection?.outcome {
+      case .completed: return "Completed"
+      case .noResult: return "No result"
+      case .produced: break
+      case nil where node.kind.isControlFlow: return "Completed"
+      case nil: break
+      }
+    }
+    return state.status.rawValue.capitalized
   }
 
   private func dominantStatus(
@@ -995,6 +1218,19 @@ private struct BehaviorTreeCanvas: View, Animatable {
     }
     return "\(snapshot.status.rawValue), event \(snapshot.sequence), "
       + "\(running) running, \(succeeded) succeeded, \(failed) failed"
+  }
+}
+
+private extension BehaviorNodeKind {
+  var isControlFlow: Bool {
+    switch self {
+    case .action, .condition, .wait, .waitForever: false
+    case .sequence, .selector, .parallel, .branch, .subtree, .dynamicSubtrees,
+      .retry, .repeatBehavior, .untilFailure, .inverter, .forceSuccess,
+      .forceFailure, .timeout, .precondition, .lifecycle, .orderedSuccess,
+      .loop, .succeed, .fail:
+      true
+    }
   }
 }
 
@@ -1040,6 +1276,8 @@ private struct BehaviorTreeExecutionStatusView: View {
 
 private struct BehaviorTreeViewportControls: View {
   @Binding var viewport: BehaviorTreeViewport
+  let currentScale: CGFloat
+  let fitScale: CGFloat
   let configuration: BehaviorTreeViewConfiguration
 
   var body: some View {
@@ -1061,6 +1299,12 @@ private struct BehaviorTreeViewportControls: View {
       }
       .frame(width: 26, height: 24)
       .disabled(!configuration.isZoomEnabled)
+
+      Button(action: actualSize) {
+        Label("Actual size", systemImage: "1.magnifyingglass")
+      }
+      .frame(width: 26, height: 24)
+      .disabled(!configuration.isZoomEnabled)
     }
     .labelStyle(.iconOnly)
     .buttonStyle(.plain)
@@ -1070,15 +1314,22 @@ private struct BehaviorTreeViewportControls: View {
   }
 
   private func zoomOut() {
-    viewport.zoom = max(configuration.minimumZoom, viewport.zoom / 1.25)
+    viewport.scale = max(configuration.minimumZoom, currentScale / 1.25)
   }
 
   private func reset() {
-    viewport = BehaviorTreeViewport()
+    viewport = BehaviorTreeViewport(
+      offset: .zero,
+      scale: min(configuration.maximumZoom, max(configuration.minimumZoom, fitScale))
+    )
   }
 
   private func zoomIn() {
-    viewport.zoom = min(configuration.maximumZoom, viewport.zoom * 1.25)
+    viewport.scale = min(configuration.maximumZoom, currentScale * 1.25)
+  }
+
+  private func actualSize() {
+    viewport.scale = min(configuration.maximumZoom, max(configuration.minimumZoom, 1))
   }
 }
 
@@ -1087,11 +1338,11 @@ private struct BehaviorTreeLegend: View {
 
   var body: some View {
     HStack(spacing: 8) {
-      legendItem("Running", status: .running)
-      legendItem("Succeeded", status: .succeeded)
-      legendItem("Failed", status: .failed)
-      legendItem("Skipped", status: .skipped)
-      legendItem("Cancelled", status: .cancelled)
+      legendItem("Running", style: theme.running)
+      legendItem("Result", style: theme.succeeded)
+      legendItem("Completed", style: theme.completed)
+      legendItem("No result", style: theme.noResult)
+      legendItem("Failed", style: theme.failed)
     }
     .padding(.horizontal, 10)
     .padding(.vertical, 7)
@@ -1103,11 +1354,11 @@ private struct BehaviorTreeLegend: View {
 
   private func legendItem(
     _ label: String,
-    status: BehaviorVisualizationStatus
+    style: BehaviorTreeViewNodeStyle
   ) -> some View {
     HStack(spacing: 3) {
       Circle()
-        .fill(theme.nodeStyle(for: status).borderColor)
+        .fill(style.borderColor)
         .frame(width: 7, height: 7)
         .accessibilityHidden(true)
       Text(verbatim: label)
@@ -1185,6 +1436,12 @@ private struct BehaviorTreeNodeInspector: View {
       if let inspection = state?.inspection {
         Divider()
         BehaviorTreeInspectorSectionHeader(title: "Inspection")
+        if let outcome = inspection.outcome {
+          BehaviorTreeInspectorValueRow(
+            label: "Outcome",
+            value: outcome.rawValue
+          )
+        }
         if let summary = inspection.summary {
           Text(summary)
             .font(.caption)
@@ -1219,7 +1476,10 @@ private struct BehaviorTreeNodeInspector: View {
   }
 
   private var statusColor: Color {
-    theme.nodeStyle(for: status).borderColor
+    theme.nodeStyle(
+      for: status,
+      inspectionOutcome: state?.inspection?.outcome
+    ).borderColor
   }
 
   private func close() {
@@ -1259,6 +1519,9 @@ private struct BehaviorTreeNodeInspector: View {
       }
     }
     if let inspection = state?.inspection {
+      if let outcome = inspection.outcome {
+        lines.append("Outcome: \(outcome.rawValue)")
+      }
       if let summary = inspection.summary {
         lines.append("Inspection: \(summary)")
       }
@@ -1465,6 +1728,7 @@ private func nodeKindLabel(_ kind: BehaviorNodeKind) -> String {
   case .wait: "Wait"
   case .waitForever: "Wait"
   case .subtree: "Subtree"
+  case .dynamicSubtrees: "Fan-out"
   case .sequence: "Sequence"
   case .selector: "Selector"
   case .branch: "Branch"
@@ -1492,6 +1756,7 @@ private func nodeKindSymbol(_ kind: BehaviorNodeKind) -> String {
   case .wait: "clock"
   case .waitForever: "infinity"
   case .subtree: "square.stack.3d.up"
+  case .dynamicSubtrees: "folder.badge.gearshape"
   case .sequence: "arrow.right"
   case .selector, .branch: "arrow.triangle.branch"
   case .parallel: "arrow.left.arrow.right"
@@ -1526,19 +1791,5 @@ private func statusSymbol(_ status: BehaviorVisualizationStatus) -> String? {
   case .failed: "xmark"
   case .skipped: "forward.end.fill"
   case .cancelled: "stop.fill"
-  }
-}
-
-private func childRoleLabel(_ role: BehaviorChildRole) -> String? {
-  switch role {
-  case .root, .child, .wrapped: nil
-  case .condition: "condition"
-  case .thenBranch: "then"
-  case .elseBranch: "else"
-  case .body(let index): "body \(index + 1)"
-  case .onSuccess: "on success"
-  case .onFailure: "on failure"
-  case .onCancel: "on cancel"
-  case .onExit: "on exit"
   }
 }

@@ -317,6 +317,37 @@ public func Subtree<Action, Condition>(
   )
 }
 
+/// Declares runtime-discovered child executions using one immutable template.
+///
+/// Discovery freezes the exact child inputs. Start creates their independent
+/// executions. Completion observes those executions until all are terminal.
+/// Each phase is an explicit node in definitions, snapshots, and telemetry.
+public func DynamicSubtrees<Action, Condition>(
+  using template: BehaviorTreeReference,
+  discover discovery: Action,
+  start: Action,
+  await completion: Action,
+  named label: String? = nil,
+  attributes: [String: BehaviorMetadataValue] = [:]
+) -> Behavior<Action, Condition> {
+  .dynamicSubtrees(
+    BehaviorNodeMetadata(label: label, attributes: attributes),
+    template: template,
+    discovery: .action(
+      BehaviorNodeMetadata(label: "Find items"),
+      discovery
+    ),
+    start: .action(
+      BehaviorNodeMetadata(label: "Start processing"),
+      start
+    ),
+    completion: .action(
+      BehaviorNodeMetadata(label: "Wait for completion"),
+      completion
+    )
+  )
+}
+
 /// Creates a sequence composite.
 public func Sequence<Action, Condition>(
   _ label: String? = nil,

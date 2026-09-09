@@ -50,9 +50,20 @@ public struct BehaviorExecutionError: Error, Sendable {
     self.nodeID = nodeID
     self.underlyingError = underlyingError
   }
+
+  public var diagnostic: BehaviorDiagnostic {
+    BehaviorDiagnostic(
+      code: "behavior.executor-threw",
+      summary: String(describing: underlyingError),
+      attributes: [
+        "error-type": .string(String(reflecting: type(of: underlyingError)))
+      ]
+    )
+  }
 }
 
 /// A runtime capability required by a tree was not supplied by its driver.
 public enum BehaviorRuntimeError: Error, Equatable, Sendable {
   case reactiveExecutionRequiresWakeUpSource
+  case runningActionRequiresHostDrivenExecution
 }

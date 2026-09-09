@@ -146,23 +146,48 @@ public enum BehaviorConditionResult: Codable, Hashable, Sendable {
   }
 }
 
-/// A terminal action decision and its optional explanation.
+/// An action's current lifecycle state and its optional explanation.
 public struct BehaviorActionResult: Codable, Hashable, Sendable {
-  public let outcome: BehaviorOutcome
+  /// The action's current lifecycle state.
+  ///
+  /// `running` is meaningful for host-driven executions. It lets an action
+  /// publish durable work and yield until an external event advances the tree
+  /// again. Continuously-run trees reject a running action because they have no
+  /// application-owned suspension boundary.
+  public let status: BehaviorStatus
   public let diagnostic: BehaviorDiagnostic?
 
   /// A successful action without additional diagnostics.
-  public static let succeeded = Self(outcome: .succeeded)
+  public static let succeeded = Self(status: .succeeded)
 
   /// A failed action without additional diagnostics.
-  public static let failed = Self(outcome: .failed)
+  public static let failed = Self(status: .failed)
+
+  /// An action that has started but is waiting for application-owned work.
+  public static let running = Self(status: .running)
+
+  /// The terminal outcome, or `nil` while the action is running.
+  public var outcome: BehaviorOutcome? { status.outcome }
 
   /// Creates an action result.
   public init(
     outcome: BehaviorOutcome,
     diagnostic: BehaviorDiagnostic? = nil
   ) {
-    self.outcome = outcome
+    status = outcome == .succeeded ? .succeeded : .failed
+    self.diagnostic = diagnostic
+  }
+
+  /// Creates an action result from one valid action lifecycle state.
+  public init(
+    status: BehaviorStatus,
+    diagnostic: BehaviorDiagnostic? = nil
+  ) {
+    precondition(
+      status == .running || status == .succeeded || status == .failed,
+      "An action result must be running, succeeded, or failed"
+    )
+    self.status = status
     self.diagnostic = diagnostic
   }
 
@@ -173,7 +198,7 @@ public struct BehaviorActionResult: Codable, Hashable, Sendable {
     attributes: [String: BehaviorMetadataValue] = [:]
   ) -> Self {
     Self(
-      outcome: .failed,
+      status: .failed,
       diagnostic: BehaviorDiagnostic(
         code: code,
         summary: summary,
@@ -189,7 +214,23 @@ public struct BehaviorActionResult: Codable, Hashable, Sendable {
     attributes: [String: BehaviorMetadataValue] = [:]
   ) -> Self {
     Self(
-      outcome: .succeeded,
+      status: .succeeded,
+      diagnostic: BehaviorDiagnostic(
+        code: code,
+        summary: summary,
+        attributes: attributes
+      )
+    )
+  }
+
+  /// Creates a running result with a stable suspension reason.
+  public static func running(
+    code: String,
+    summary: String? = nil,
+    attributes: [String: BehaviorMetadataValue] = [:]
+  ) -> Self {
+    Self(
+      status: .running,
       diagnostic: BehaviorDiagnostic(
         code: code,
         summary: summary,

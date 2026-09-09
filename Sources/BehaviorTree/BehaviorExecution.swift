@@ -40,6 +40,7 @@ private struct AdvanceNodeState {
   var status: BehaviorStatus = .idle
   var activation: UInt64
   var runtimeState: BehaviorNodeRuntimeState
+  var inspection: BehaviorInspection?
   var diagnostic: BehaviorDiagnostic?
   var skipped = false
 
@@ -48,10 +49,11 @@ private struct AdvanceNodeState {
     activation: UInt64
   ) {
     self.activation = activation
+    inspection = nil
     switch operation {
     case .wait, .timeout:
       runtimeState = .elapsed(nanoseconds: 0)
-    case .sequence, .selector, .orderedSuccess:
+    case .dynamicSubtrees, .sequence, .selector, .orderedSuccess:
       runtimeState = .cursor(0)
     case .branch:
       runtimeState = .branch(selectedChild: nil)
@@ -78,6 +80,7 @@ private struct AdvanceNodeState {
     status = snapshot.status
     activation = snapshot.activation ?? 0
     runtimeState = snapshot.runtimeState
+    inspection = snapshot.inspection
     diagnostic = snapshot.diagnostic
     skipped = snapshot.skipped
   }
@@ -87,6 +90,7 @@ private struct AdvanceNodeState {
       status: status,
       activation: activation,
       runtimeState: runtimeState,
+      inspection: inspection,
       diagnostic: diagnostic,
       skipped: skipped
     )
@@ -285,6 +289,7 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
   private var eventSequence: UInt64
   private var elapsedNanoseconds: Int64
   private var didStart: Bool
+  private var checkpointSink: BehaviorCheckpointSink?
 
   /// The stable identity shared by snapshots and telemetry.
   public let executionID: BehaviorExecutionID
@@ -318,6 +323,7 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
     elapsedNanoseconds = snapshot?.elapsedNanoseconds ?? 0
     status = snapshot?.status ?? .idle
     didStart = snapshot.map { $0.status != .idle } ?? false
+    checkpointSink = nil
   }
 
   /// Advances the tree once using elapsed time supplied by the host.
@@ -328,7 +334,8 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
   public mutating func advance<Executor: BehaviorExecutor>(
     in context: Executor.Context,
     using executor: Executor,
-    elapsed: Duration = .zero
+    elapsed: Duration = .zero,
+    checkpointing checkpointSink: BehaviorCheckpointSink? = nil
   ) async throws -> BehaviorStatus
   where Executor.Action == Action, Executor.Condition == Condition {
     let delta = BehaviorDuration(elapsed).nanoseconds
@@ -336,6 +343,8 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
     if status == .succeeded || status == .failed || status == .cancelled {
       return status
     }
+    self.checkpointSink = checkpointSink
+    defer { self.checkpointSink = nil }
     elapsedNanoseconds = saturatingAdd(elapsedNanoseconds, delta)
     if !didStart {
       didStart = true
@@ -353,7 +362,11 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
       if let outcome = status.outcome {
         emit(.executionCompleted, outcome: outcome, diagnostic: result.diagnostic)
       }
+      try await checkpointSink?.save(snapshot())
       return status
+    } catch let error as BehaviorExecutionError {
+      emit(.executionFailed, diagnostic: error.diagnostic)
+      throw error
     } catch {
       emit(.executionFailed)
       throw error
@@ -426,6 +439,7 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
     if states[index]!.status == .idle {
       states[index]!.status = .running
       emit(.nodeEntered, nodeIndex: index)
+      try await checkpointSink?.save(snapshot())
     }
 
     let result: AdvanceResult
@@ -437,12 +451,31 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
         elapsedNanoseconds: elapsedNanoseconds
       )
     } catch let error as BehaviorExecutionError {
+      if error.nodeID == tree.plan.nodes[index].id {
+        states[index]!.status = .failed
+        states[index]!.diagnostic = error.diagnostic
+        emit(
+          .nodeFailed,
+          nodeIndex: index,
+          outcome: .failed,
+          diagnostic: error.diagnostic
+        )
+      }
       throw error
     } catch {
-      throw BehaviorExecutionError(
+      let executionError = BehaviorExecutionError(
         nodeID: tree.plan.nodes[index].id,
         underlyingError: error
       )
+      states[index]!.status = .failed
+      states[index]!.diagnostic = executionError.diagnostic
+      emit(
+        .nodeFailed,
+        nodeIndex: index,
+        outcome: .failed,
+        diagnostic: executionError.diagnostic
+      )
+      throw executionError
     }
 
     if result.status == .running {
@@ -459,6 +492,7 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
         outcome: result.status.outcome,
         diagnostic: result.diagnostic
       )
+      try await checkpointSink?.save(snapshot())
     }
     return result
   }
@@ -474,6 +508,7 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
     switch node.operation {
     case .action(let action):
       let progressSequence = Mutex(eventSequence)
+      let latestInspection = Mutex(states[index]?.inspection)
       let description = definitionDescription(
         of: node.operation,
         actionName: { _ in "Action" },
@@ -489,7 +524,7 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
       let parentID = node.parent.map { tree.plan.nodes[$0].id }
       let observers = observers
       let elapsedNanoseconds = elapsedNanoseconds
-      let reporter = BehaviorReporter { report in
+      let reporter = BehaviorReporter(nodeID: node.id) { report in
         let sequence = progressSequence.withLock { sequence in
           sequence &+= 1
           return sequence
@@ -506,6 +541,7 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
           phase = .nodeInspected
           progress = nil
           inspection = value
+          latestInspection.withLock { $0 = value }
         }
         let event = BehaviorEvent(
           treeName: treeName,
@@ -535,11 +571,13 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
         )
       } catch {
         eventSequence = progressSequence.withLock { $0 }
+        states[index]!.inspection = latestInspection.withLock { $0 }
         throw error
       }
       eventSequence = progressSequence.withLock { $0 }
+      states[index]!.inspection = latestInspection.withLock { $0 }
       return AdvanceResult(
-        status: result.outcome == .succeeded ? .succeeded : .failed,
+        status: result.status,
         diagnostic: result.diagnostic,
         skipped: false,
         remainingNanoseconds: elapsedNanoseconds
@@ -574,6 +612,15 @@ public struct BehaviorExecution<Action: Sendable, Condition: Sendable> {
     case .subtree:
       return try await stepWrappedChild(
         at: index,
+        in: context,
+        using: executor,
+        elapsedNanoseconds: elapsedNanoseconds
+      )
+
+    case .dynamicSubtrees:
+      return try await stepSequence(
+        at: index,
+        memory: .remembering,
         in: context,
         using: executor,
         elapsedNanoseconds: elapsedNanoseconds
@@ -1325,7 +1372,8 @@ private func snapshotStateIsValid<Action, Condition>(
   case (.timeout(let duration), .elapsed(let elapsed)):
     return elapsed >= 0 && elapsed <= duration.nanoseconds
 
-  case (.sequence, .cursor(let cursor)),
+  case (.dynamicSubtrees, .cursor(let cursor)),
+    (.sequence, .cursor(let cursor)),
     (.selector, .cursor(let cursor)),
     (.orderedSuccess, .cursor(let cursor)):
     return cursor >= 0 && cursor <= node.children.count
@@ -1362,7 +1410,8 @@ private func snapshotStateIsValid<Action, Condition>(
       return outcome != nil
     }
 
-  case (.action, .none), (.condition, .none), (.succeed, .none),
+  case (.action, .none), (.condition, .none),
+    (.succeed, .none),
     (.fail, .none), (.waitForever, .none), (.parallel, .none),
     (.untilFailure, .none), (.invert, .none), (.forceSuccess, .none),
     (.forceFailure, .none), (.subtree, .none):
@@ -1421,6 +1470,7 @@ private func definitionKind<Action, Condition>(
   case .wait: return .wait
   case .waitForever: return .waitForever
   case .subtree: return .subtree
+  case .dynamicSubtrees: return .dynamicSubtrees
   case .sequence: return .sequence
   case .selector: return .selector
   case .branch: return .branch

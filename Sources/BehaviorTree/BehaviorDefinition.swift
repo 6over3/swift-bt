@@ -7,6 +7,7 @@ public enum BehaviorNodeKind: String, Codable, Hashable, Sendable {
   case wait
   case waitForever
   case subtree
+  case dynamicSubtrees
   case sequence
   case selector
   case branch
@@ -58,13 +59,35 @@ public struct BehaviorDefinitionNode: Codable, Hashable, Sendable {
 public struct BehaviorTreeDefinition: Codable, Hashable, Sendable {
   public let name: String
   public let version: String
+  /// The dynamic-subtree template family this concrete definition implements.
+  public let templateFamily: BehaviorTreeReference?
   public let root: BehaviorDefinitionNode
 
   /// Creates a static tree definition.
-  public init(name: String, version: String, root: BehaviorDefinitionNode) {
+  public init(
+    name: String,
+    version: String,
+    templateFamily: BehaviorTreeReference? = nil,
+    root: BehaviorDefinitionNode
+  ) {
     self.name = name
     self.version = version
+    self.templateFamily = templateFamily
     self.root = root
+  }
+
+  /// Finds one node by its stable path identifier.
+  ///
+  /// The lookup is iterative so deeply composed trees do not consume the call
+  /// stack. It visits at most every definition node and performs no allocation
+  /// proportional to the number of siblings already visited.
+  public func node(identifiedBy id: BehaviorNodeID) -> BehaviorDefinitionNode? {
+    var pending = [root]
+    while let node = pending.popLast() {
+      if node.id == id { return node }
+      pending.append(contentsOf: node.children.reversed())
+    }
+    return nil
   }
 
   /// Returns Graphviz DOT describing this tree.
@@ -87,7 +110,7 @@ public struct BehaviorTreeDefinition: Codable, Hashable, Sendable {
   ) throws(BehaviorVisualizationError) -> String {
     guard snapshot.treeName == name,
       snapshot.treeVersion == version,
-      Set(snapshot.nodes.keys) == definitionNodeIDs(root)
+      Set(snapshot.nodes.keys) == executableDefinitionNodeIDs(root)
     else {
       throw .definitionMismatch
     }
@@ -136,6 +159,7 @@ extension BehaviorTree {
     BehaviorTreeDefinition(
       name: name,
       version: version,
+      templateFamily: templateFamily,
       root: makeDefinitionNode(
         at: 0,
         actionName: actionName,
@@ -155,6 +179,14 @@ extension BehaviorTree {
       actionName: actionName,
       conditionName: conditionName
     )
+    let children =
+      node.children.map {
+        makeDefinitionNode(
+          at: $0,
+          actionName: actionName,
+          conditionName: conditionName
+        )
+      } + dynamicTemplateChild(for: node)
     return BehaviorDefinitionNode(
       id: node.id,
       parentID: node.parent.map { plan.nodes[$0].id },
@@ -164,14 +196,29 @@ extension BehaviorTree {
       attributes: node.metadata.attributes.merging(description.attributes) {
         declared, _ in declared
       },
-      children: node.children.map {
-        makeDefinitionNode(
-          at: $0,
-          actionName: actionName,
-          conditionName: conditionName
-        )
-      }
+      children: children
     )
+  }
+
+  private func dynamicTemplateChild(
+    for node: BehaviorPlanNode<Action, Condition>
+  ) -> [BehaviorDefinitionNode] {
+    guard case .dynamicSubtrees(let name, let version) = node.operation else {
+      return []
+    }
+    return [
+      BehaviorDefinitionNode(
+        id: node.id.child(node.children.count),
+        parentID: node.id,
+        role: .template,
+        kind: .subtree,
+        label: name,
+        attributes: [
+          "treeName": .string(name),
+          "treeVersion": .string(version),
+        ]
+      )
+    ]
   }
 }
 
@@ -199,6 +246,15 @@ func definitionDescription<Action, Condition>(
       [
         "treeName": .string(name),
         "treeVersion": .string(version),
+      ]
+    )
+  case .dynamicSubtrees(let name, let version):
+    return (
+      .dynamicSubtrees,
+      name,
+      [
+        "templateTreeName": .string(name),
+        "templateTreeVersion": .string(version),
       ]
     )
   case .sequence(let memory):
@@ -304,6 +360,7 @@ private func appendGraphviz(
   case .condition: shape = "ellipse"
   case .action: shape = "box"
   case .subtree: shape = "component"
+  case .dynamicSubtrees: shape = "folder"
   case .sequence, .selector, .parallel, .orderedSuccess, .branch, .loop:
     shape = "diamond"
   case .succeed, .fail, .wait, .waitForever: shape = "oval"
@@ -379,11 +436,12 @@ private func graphvizEdgeAttributes(
   return attributes
 }
 
-private func definitionNodeIDs(
+private func executableDefinitionNodeIDs(
   _ node: BehaviorDefinitionNode
 ) -> Set<BehaviorNodeID> {
   node.children.reduce(into: Set([node.id])) { result, child in
-    result.formUnion(definitionNodeIDs(child))
+    guard child.role != .template else { return }
+    result.formUnion(executableDefinitionNodeIDs(child))
   }
 }
 
@@ -482,6 +540,11 @@ private func graphvizRoleLabel(_ role: BehaviorChildRole) -> String? {
   case .onFailure: return "on failure"
   case .onCancel: return "on cancel"
   case .onExit: return "on exit"
+  case .discovery: return "discover"
+  case .start: return "start"
+  case .completion: return "complete"
+  case .template: return "template"
+  case .execution(let index): return "execution \(index + 1)"
   }
 }
 

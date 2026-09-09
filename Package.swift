@@ -21,6 +21,10 @@ let package = Package(
   ],
   dependencies: [
     .package(
+      url: "https://github.com/lukilabs/elk-swift.git",
+      exact: "1.0.2"
+    ),
+    .package(
       url: "https://github.com/apple/swift-log.git",
       from: "1.15.0"
     ),
@@ -37,7 +41,10 @@ let package = Package(
     .target(name: "BehaviorTree"),
     .target(
       name: "BehaviorTreeUI",
-      dependencies: ["BehaviorTree"]
+      dependencies: [
+        "BehaviorTree",
+        .product(name: "ElkSwift", package: "elk-swift"),
+      ]
     ),
     .target(
       name: "BehaviorTreeLogging",

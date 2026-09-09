@@ -323,5 +323,10 @@ private func roleName(_ role: BehaviorChildRole) -> String {
   case .onFailure: "on_failure"
   case .onCancel: "on_cancel"
   case .onExit: "on_exit"
+  case .discovery: "discovery"
+  case .start: "start"
+  case .completion: "completion"
+  case .template: "template"
+  case .execution(let index): "execution:\(index)"
   }
 }

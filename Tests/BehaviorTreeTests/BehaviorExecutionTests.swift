@@ -8,7 +8,9 @@ private enum HostAction: Hashable, Sendable {
   case immediate(String)
   case delayed(String, Duration)
   case fail(String)
+  case inspect(String)
   case setAllowed(Bool)
+  case waitForPermission(String)
 }
 
 private enum HostCondition: Hashable, Sendable {
@@ -59,12 +61,80 @@ private struct HostExecutor: BehaviorExecutor {
     case .fail(let name):
       context.actionCalls[name, default: 0] += 1
       return .failed
+    case .inspect(let summary):
+      await reporting.report(
+        inspection: BehaviorInspection(summary: summary)
+      )
+      return .succeeded
     case .setAllowed(let allowed):
       context.allowed = allowed
+      return .succeeded
+    case .waitForPermission(let name):
+      context.actionCalls[name, default: 0] += 1
+      guard context.allowed else { return .running }
+      context.completions.append(name)
       return .succeeded
     }
   }
 
+}
+
+@MainActor
+@Test
+func hostCheckpointRetainsReportedInspection() async throws {
+  let tree = try BehaviorTree<HostAction, HostCondition>(name: "inspection") {
+    Action(.inspect("decoded three records"))
+  }
+  var execution = tree.makeExecution()
+
+  #expect(
+    try await execution.advance(in: HostContext(), using: HostExecutor()) == .succeeded
+  )
+  let checkpoint = execution.snapshot()
+  #expect(checkpoint.nodes[.root]?.inspection?.summary == "decoded three records")
+
+  let restored = try tree.makeExecution(
+    restoring: JSONDecoder().decode(
+      BehaviorExecutionSnapshot.self,
+      from: JSONEncoder().encode(checkpoint)
+    )
+  )
+  #expect(restored.snapshot().nodes[.root]?.inspection == checkpoint.nodes[.root]?.inspection)
+}
+
+@MainActor
+@Test
+func dynamicSubtreesResumeAtTheirExplicitNode() async throws {
+  let tree = try BehaviorTree<HostAction, HostCondition>(
+    name: "dynamic-parent",
+    version: "2"
+  ) {
+    DynamicSubtrees(
+      using: BehaviorTreeReference(name: "image-region", version: "5"),
+      discover: .immediate("discover-regions"),
+      start: .immediate("start-regions"),
+      await: .waitForPermission("regions"),
+      named: "Process each region"
+    )
+  }
+  let context = HostContext()
+  context.allowed = false
+  var execution = tree.makeExecution()
+
+  #expect(try await execution.advance(in: context, using: HostExecutor()) == .running)
+  #expect(execution.snapshot().nodes[.root]?.status == .running)
+  #expect(context.completions == ["discover-regions", "start-regions"])
+
+  let encoded = try JSONEncoder().encode(execution.snapshot())
+  let snapshot = try JSONDecoder().decode(BehaviorExecutionSnapshot.self, from: encoded)
+  execution = try tree.makeExecution(restoring: snapshot)
+  context.allowed = true
+
+  #expect(try await execution.advance(in: context, using: HostExecutor()) == .succeeded)
+  #expect(context.actionCalls["regions"] == 2)
+  #expect(
+    context.completions == ["discover-regions", "start-regions", "regions"]
+  )
 }
 
 @MainActor

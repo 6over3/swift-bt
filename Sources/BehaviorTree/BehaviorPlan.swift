@@ -11,6 +11,16 @@ public enum BehaviorChildRole: Codable, Hashable, Sendable {
   case onFailure
   case onCancel
   case onExit
+  /// Produces and freezes the concrete inputs of a dynamic collection.
+  case discovery
+  /// Creates or resumes the concrete child executions.
+  case start
+  /// Observes the concrete child executions until they are terminal.
+  case completion
+  /// The declared tree template instantiated by a dynamic-subtree node.
+  case template
+  /// One concrete execution instantiated from a dynamic-subtree template.
+  case execution(Int)
 }
 
 struct BehaviorPlan<Action, Condition> {
@@ -65,6 +75,7 @@ enum BehaviorPlanOperation<Action, Condition> {
   case wait(BehaviorDuration)
   case waitForever
   case subtree(name: String, version: String)
+  case dynamicSubtrees(templateName: String, templateVersion: String)
   case sequence(BehaviorMemoryPolicy)
   case selector(BehaviorMemoryPolicy)
   case branch
@@ -100,6 +111,11 @@ extension BehaviorChildRole {
     case .onFailure: return "failure"
     case .onCancel: return "cancel"
     case .onExit: return "exit"
+    case .discovery: return "discovery"
+    case .start: return "start"
+    case .completion: return "completion"
+    case .template: return "template"
+    case .execution(let index): return "execution:\(index)"
     }
   }
 }
@@ -115,6 +131,8 @@ extension BehaviorPlanOperation {
     case .waitForever: return "waitForever"
     case .subtree(let name, let version):
       return "subtree:\(name.utf8.count):\(name):\(version.utf8.count):\(version)"
+    case .dynamicSubtrees(let name, let version):
+      return "dynamicSubtrees:\(name.utf8.count):\(name):\(version.utf8.count):\(version)"
     case .sequence(let memory): return "sequence:\(memory.rawValue)"
     case .selector(let memory): return "selector:\(memory.rawValue)"
     case .branch: return "branch"
@@ -214,6 +232,14 @@ private func planDescription<Action, Condition>(
   case .waitForever(let metadata): return (metadata, .waitForever)
   case .subtree(let metadata, let name, let version, _):
     return (metadata, .subtree(name: name, version: version))
+  case .dynamicSubtrees(let metadata, let template, _, _, _):
+    return (
+      metadata,
+      .dynamicSubtrees(
+        templateName: template.name,
+        templateVersion: template.version
+      )
+    )
   case .sequence(let metadata, let memory, _): return (metadata, .sequence(memory))
   case .selector(let metadata, let memory, _): return (metadata, .selector(memory))
   case .branch(let metadata, _, _, _): return (metadata, .branch)
@@ -242,8 +268,15 @@ private func planChildren<Action, Condition>(
   of behavior: Behavior<Action, Condition>
 ) -> [(behavior: Behavior<Action, Condition>, role: BehaviorChildRole)] {
   switch behavior {
-  case .action, .condition, .succeed, .fail, .wait, .waitForever:
+  case .action, .condition, .succeed, .fail, .wait,
+    .waitForever:
     return []
+  case .dynamicSubtrees(_, _, let discovery, let start, let completion):
+    return [
+      (discovery, .discovery),
+      (start, .start),
+      (completion, .completion),
+    ]
   case .subtree(_, _, _, let child):
     return [(child, .wrapped)]
   case .sequence(_, _, let children), .selector(_, _, let children),

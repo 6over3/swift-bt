@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import BehaviorTree
@@ -277,6 +278,42 @@ func inspectionReplacesPriorProjectionAndClearsOnReentry() throws {
     )
   )
   #expect(snapshot.nodes[.root]?.inspection == nil)
+}
+
+@Test
+func inspectionRoundTripsStructuredDataAndOpaqueAttachments() throws {
+  let inspection = BehaviorInspection(
+    summary: "Prepared two outputs",
+    sections: [
+      BehaviorInspectionSection(
+        id: "request",
+        title: "Request",
+        value: .object([
+          "items": .array([.string("first"), .string("second")]),
+          "enabled": .boolean(true),
+          "attempt": .integer(2),
+          "score": .double(0.75),
+          "missing": .null,
+        ])
+      )
+    ],
+    attachments: [
+      BehaviorInspectionAttachment(
+        id: "host-reference-1",
+        label: "Preview",
+        role: "output",
+        contentType: "image/png",
+        byteCount: 512,
+        attributes: ["temporary": true]
+      )
+    ]
+  )
+
+  let encoded = try JSONEncoder().encode(inspection)
+  let decoded = try JSONDecoder().decode(BehaviorInspection.self, from: encoded)
+
+  #expect(decoded == inspection)
+  #expect(decoded.attachments.first?.id == "host-reference-1")
 }
 
 @Test

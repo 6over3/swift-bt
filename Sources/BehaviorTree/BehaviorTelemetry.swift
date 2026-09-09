@@ -45,6 +45,83 @@ public struct BehaviorProgress: Codable, Hashable, Sendable {
   }
 }
 
+/// Recursively structured, application-provided inspection data.
+///
+/// The behavior runtime does not interpret these values. Hosts can use them to
+/// present request inputs, decisions, and result summaries without teaching the
+/// behavior-tree package about application domain types.
+public indirect enum BehaviorInspectionValue: Codable, Hashable, Sendable {
+  case null
+  case boolean(Bool)
+  case integer(Int64)
+  case double(Double)
+  case string(String)
+  case array([BehaviorInspectionValue])
+  case object([String: BehaviorInspectionValue])
+}
+
+/// One ordered group of structured inspection data.
+public struct BehaviorInspectionSection: Codable, Hashable, Sendable {
+  public let id: String
+  public let title: String
+  public let value: BehaviorInspectionValue
+
+  public init(
+    id: String,
+    title: String,
+    value: BehaviorInspectionValue
+  ) {
+    self.id = id
+    self.title = title
+    self.value = value
+  }
+}
+
+/// An opaque application attachment associated with a behavior node.
+///
+/// The identifier is meaningful only to the host. Swift-BT never opens,
+/// persists, uploads, or interprets the referenced content.
+public struct BehaviorInspectionAttachment: Codable, Hashable, Sendable {
+  public let id: String
+  public let label: String
+  public let role: String?
+  public let contentType: String?
+  public let byteCount: Int64?
+  public let attributes: [String: BehaviorMetadataValue]
+
+  public init(
+    id: String,
+    label: String,
+    role: String? = nil,
+    contentType: String? = nil,
+    byteCount: Int64? = nil,
+    attributes: [String: BehaviorMetadataValue] = [:]
+  ) {
+    self.id = id
+    self.label = label
+    self.role = role
+    self.contentType = contentType
+    self.byteCount = byteCount
+    self.attributes = attributes
+  }
+}
+
+/// The application-visible result of a successfully executed behavior.
+///
+/// Execution status and result meaning are intentionally separate. An action
+/// can complete normally without producing a match, while a produced result
+/// can still be inspected independently from the runtime's success state.
+public enum BehaviorInspectionOutcome: String, Codable, Hashable, Sendable {
+  /// The behavior completed, but it does not claim that it produced a value.
+  case completed
+
+  /// The behavior produced one or more application-meaningful values.
+  case produced
+
+  /// The behavior completed normally and found no applicable value.
+  case noResult
+}
+
 /// A deliberately selected projection of application state for inspection.
 ///
 /// Domain values and mutable workflow state remain in the executor context.
@@ -52,15 +129,24 @@ public struct BehaviorProgress: Codable, Hashable, Sendable {
 /// may be displayed, serialized, logged, or sent to a tracing backend.
 public struct BehaviorInspection: Codable, Hashable, Sendable {
   public let summary: String?
+  public let outcome: BehaviorInspectionOutcome?
   public let values: [String: BehaviorMetadataValue]
+  public let sections: [BehaviorInspectionSection]
+  public let attachments: [BehaviorInspectionAttachment]
 
   /// Creates a node-scoped inspection projection.
   public init(
     summary: String? = nil,
-    values: [String: BehaviorMetadataValue] = [:]
+    outcome: BehaviorInspectionOutcome? = nil,
+    values: [String: BehaviorMetadataValue] = [:],
+    sections: [BehaviorInspectionSection] = [],
+    attachments: [BehaviorInspectionAttachment] = []
   ) {
     self.summary = summary
+    self.outcome = outcome
     self.values = values
+    self.sections = sections
+    self.attachments = attachments
   }
 }
 
@@ -162,9 +248,18 @@ public struct BehaviorObserver: Sendable {
 
 /// Reports progress and inspection data from an action.
 public struct BehaviorReporter: Sendable {
+  /// The exact action node receiving reports and executing host work.
+  ///
+  /// Hosts can use this stable identifier to attach externally persisted child
+  /// executions or artifacts to the declaring behavior-tree node.
+  public let nodeID: BehaviorNodeID
   private let emitReport: @Sendable (BehaviorReport) async -> Void
 
-  init(_ emitReport: @escaping @Sendable (BehaviorReport) async -> Void) {
+  init(
+    nodeID: BehaviorNodeID,
+    _ emitReport: @escaping @Sendable (BehaviorReport) async -> Void
+  ) {
+    self.nodeID = nodeID
     self.emitReport = emitReport
   }
 

@@ -195,6 +195,12 @@ await reporting.report(
 )
 ```
 
+Inspections can also include recursively structured sections and opaque
+attachment references. The host owns attachment storage and presentation;
+Swift-BT only preserves the identifier and display metadata. This keeps the
+inspection API useful for documents, media, build products, and other domains
+without adding application-specific concepts to the behavior runtime.
+
 The latest inspection replaces the previous inspection for that node
 activation and is cleared when the node starts again. It travels as a
 `nodeInspected` event, appears in visualization snapshots, the SwiftUI node
@@ -270,6 +276,8 @@ let result = try await task.value
 - `Invert`, `ForceSuccess`, `ForceFailure`, `Timeout`, and `Precondition`
 - `Lifecycle` with typed success, failure, cancellation, and exit hooks
 - `Subtree` for named, reusable tree composition
+- `DynamicSubtrees` for runtime-discovered child executions of one declared
+  tree template
 - `Wait`, `WaitForever`, `Succeed`, and `Fail`
 
 `Sequence` and `Selector` remember their active child by default. Set
@@ -305,6 +313,87 @@ events, snapshots, and visualizations. Reusing one subtree in several places
 gives each embedding parent-scoped node IDs and independent runtime state. The
 host still owns the shared context and any values produced by earlier actions.
 
+### Runtime-discovered subtrees
+
+Use `DynamicSubtrees` when the parent does not know the number of child
+executions until runtime. The definition still declares the only tree template
+that those children can use:
+
+```swift
+let imageRegions = BehaviorTreeReference(
+  name: "image-region",
+  version: "3"
+)
+
+let image = try BehaviorTree<Operation, Predicate>(name: "image") {
+  Sequence {
+    Action(.analyze)
+    DynamicSubtrees(
+      using: imageRegions,
+      discover: .discoverRegions,
+      start: .startRegions,
+      await: .awaitRegions,
+      named: "Process each region"
+    )
+    Action(.publish)
+  }
+}
+```
+
+`DynamicSubtrees` is a first-class node, not an implicit loop hidden in a
+neighboring action. The discovery action freezes the inputs, the start action
+creates or resumes their concrete executions, and the await action returns
+`.running` until they are terminal. The host persists each concrete child with
+the parent execution ID and this node's ID. Re-entering any action after
+restoration must be idempotent.
+
+The referenced template is not recursively embedded in the static definition.
+A child template can discover more children from the same template family, so
+recursive embedding could make the definition infinite. The immutable
+definition records the typed template name and version. The host records every
+concrete parent-child relationship with `BehaviorExecutionTree`. Each dynamic
+declaration has an explicit state:
+
+- `.pending` means discovery has not frozen the child inputs.
+- `.frozen(discoveredCount: 0)` means discovery completed and found nothing.
+- `.frozen(discoveredCount: count)` plus its child executions records a partial
+  or complete fan-out.
+
+Each child is another `BehaviorExecutionTree`, so the same representation
+retains arbitrary runtime depth and round-trips through `Codable`:
+
+```swift
+let executionTree = try BehaviorExecutionTree(
+  definition: parentDefinition,
+  snapshot: parentSnapshot,
+  dynamicChildren: [
+    BehaviorDynamicChildExecutions(
+      declarationNodeID: processRegionsNodeID,
+      state: .frozen(discoveredCount: regionExecutions.count),
+      executions: regionExecutions
+    )
+  ]
+)
+```
+
+A dynamic declaration can name a template family whose concrete executions use
+different definitions. Declare that relationship explicitly instead of relying
+on name prefixes:
+
+```swift
+let musicRegion = try BehaviorTree<Operation, Predicate>(
+  name: "image-region.music-release",
+  version: "3",
+  templateFamily: imageRegions
+) {
+  // Specialized behavior for this region type.
+}
+```
+
+The initializer rejects missing declarations, template mismatches, duplicate
+execution IDs, and contradictory discovery state. It does not guess topology
+from labels or neighboring actions.
+
 ## Visualization and telemetry
 
 ### Native SwiftUI view
@@ -325,6 +414,23 @@ BehaviorTreeView(visualization: visualization)
   .behaviorTreeLegendVisible(true)
 ```
 
+For a persisted workflow with runtime-discovered children, project the complete
+recursive execution instead of rendering only its static root definition:
+
+```swift
+let projection = try BehaviorExecutionTreeProjection(tree: executionTree)
+
+BehaviorExecutionTreeView(
+  projection: projection,
+  selection: $selectedNode
+)
+```
+
+Concrete child roots appear directly under the `DynamicSubtrees` node that
+created them, including deeper fan-outs. Selection returns a
+`BehaviorExecutionNodeReference` containing both the execution ID and the local
+node ID, so an inspector can load the exact persisted execution.
+
 `lookup` is the complete tree. `makeVisualization()` derives its full topology;
 the sample action and condition enums use string raw values as display labels.
 For other domain types, pass `actionLabel:` and `conditionLabel:` closures.
@@ -340,6 +446,15 @@ The renderer uses one asynchronously rendered SwiftUI `Canvas`. Tree layout is
 computed once, off the main actor, while viewport culling avoids resolving text
 or drawing geometry outside the visible region. For definitions reused across
 several views, precompute the immutable layout explicitly:
+
+The diagram is a control-flow projection, not a drawing of the definition's
+containment hierarchy. Its native Swift layered layout follows the structured
+Sugiyama phases: feedback-edge removal, rank assignment, dummy tracks for long
+edges, stable median crossing reduction, coordinate straightening, and
+orthogonal routing. Dynamic child executions remain attached between their
+declared start and completion phases and appear inside recursively nested
+execution boundaries. This keeps conditions, loops, parallel work, and runtime
+fan-out readable without a graph-layout dependency.
 
 ```swift
 let layout = BehaviorTreeDiagramLayout(

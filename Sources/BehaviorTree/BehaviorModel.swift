@@ -47,6 +47,17 @@ public enum UnsatisfiedPreconditionPolicy: String, Codable, Hashable, Sendable {
   case fail
 }
 
+/// Stable identity of a child-tree template or template family.
+public struct BehaviorTreeReference: Codable, Hashable, Sendable {
+  public let name: String
+  public let version: String
+
+  public init(name: String, version: String) {
+    self.name = name
+    self.version = version
+  }
+}
+
 /// An immutable behavior-tree node.
 public indirect enum Behavior<Action, Condition> {
   case action(BehaviorNodeMetadata, Action)
@@ -60,6 +71,19 @@ public indirect enum Behavior<Action, Condition> {
     name: String,
     version: String,
     child: Self
+  )
+  /// A runtime-discovered collection of independently executed subtrees.
+  ///
+  /// Discovery, execution creation, and completion are explicit children of
+  /// this remembering composite. The reference identifies their immutable
+  /// template family without recursively embedding definitions that may
+  /// reference the same family.
+  case dynamicSubtrees(
+    BehaviorNodeMetadata,
+    template: BehaviorTreeReference,
+    discovery: Self,
+    start: Self,
+    completion: Self
   )
   case sequence(BehaviorNodeMetadata, BehaviorMemoryPolicy, [Self])
   case selector(BehaviorNodeMetadata, BehaviorMemoryPolicy, [Self])

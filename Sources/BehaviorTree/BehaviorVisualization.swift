@@ -63,6 +63,69 @@ public struct BehaviorVisualizationSnapshot: Codable, Hashable, Sendable {
     nodes = visualizationNodeStates(in: definition.root)
   }
 
+  /// Reconstructs display state from one durable host checkpoint.
+  ///
+  /// Checkpoints contain only nodes that have participated in the execution.
+  /// Definition nodes absent from the checkpoint remain idle. This initializer
+  /// makes restored and historical executions inspectable without replaying an
+  /// event stream that the host was not required to persist.
+  public init(
+    definition: BehaviorTreeDefinition,
+    execution: BehaviorExecutionSnapshot
+  ) throws(BehaviorVisualizationError) {
+    guard execution.treeName == definition.name,
+      execution.treeVersion == definition.version
+    else {
+      throw .eventTreeMismatch(
+        expectedName: definition.name,
+        expectedVersion: definition.version,
+        actualName: execution.treeName,
+        actualVersion: execution.treeVersion
+      )
+    }
+
+    var nodeStates = visualizationNodeStates(in: definition.root)
+    for (nodeID, checkpoint) in execution.nodes {
+      guard nodeStates[nodeID] != nil else {
+        throw .unknownNode(nodeID)
+      }
+      nodeStates[nodeID] = BehaviorNodeVisualizationState(
+        status: checkpoint.skipped
+          ? .skipped
+          : visualizationStatus(checkpoint.status),
+        activation: checkpoint.activation,
+        inspection: checkpoint.inspection,
+        diagnostic: checkpoint.diagnostic
+      )
+    }
+
+    treeName = definition.name
+    treeVersion = definition.version
+    executionID = execution.executionID
+    sequence = execution.eventSequence
+    status = execution.status
+    diagnostic = nil
+    latestEvent = nil
+    nodes = nodeStates
+  }
+
+  init(
+    definition: BehaviorTreeDefinition,
+    executionID: BehaviorExecutionID,
+    sequence: UInt64,
+    status: BehaviorStatus,
+    nodes: [BehaviorNodeID: BehaviorNodeVisualizationState]
+  ) {
+    treeName = definition.name
+    treeVersion = definition.version
+    self.executionID = executionID
+    self.sequence = sequence
+    self.status = status
+    diagnostic = nil
+    latestEvent = nil
+    self.nodes = nodes
+  }
+
   /// Applies the next ordered event and returns the updated snapshot.
   ///
   /// Sequence gaps are accepted so bounded telemetry streams may discard older
@@ -236,6 +299,18 @@ public struct BehaviorVisualizationSnapshot: Codable, Hashable, Sendable {
     for nodeID in nodes.keys {
       nodes[nodeID] = BehaviorNodeVisualizationState()
     }
+  }
+}
+
+private func visualizationStatus(
+  _ status: BehaviorStatus
+) -> BehaviorVisualizationStatus {
+  switch status {
+  case .idle: .idle
+  case .running: .running
+  case .succeeded: .succeeded
+  case .failed: .failed
+  case .cancelled: .cancelled
   }
 }
 

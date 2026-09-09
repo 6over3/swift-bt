@@ -27,6 +27,7 @@ public struct BehaviorNodeSnapshot: Codable, Hashable, Sendable {
   public let status: BehaviorStatus
   public let activation: UInt64?
   public let runtimeState: BehaviorNodeRuntimeState
+  public let inspection: BehaviorInspection?
   public let diagnostic: BehaviorDiagnostic?
   public let skipped: Bool
 
@@ -35,12 +36,14 @@ public struct BehaviorNodeSnapshot: Codable, Hashable, Sendable {
     status: BehaviorStatus,
     activation: UInt64? = nil,
     runtimeState: BehaviorNodeRuntimeState = .none,
+    inspection: BehaviorInspection? = nil,
     diagnostic: BehaviorDiagnostic? = nil,
     skipped: Bool = false
   ) {
     self.status = status
     self.activation = activation
     self.runtimeState = runtimeState
+    self.inspection = inspection
     self.diagnostic = diagnostic
     self.skipped = skipped
   }
@@ -76,5 +79,26 @@ public struct BehaviorExecutionSnapshot: Codable, Hashable, Sendable {
     self.eventSequence = eventSequence
     self.elapsedNanoseconds = elapsedNanoseconds
     self.nodes = nodes
+  }
+}
+
+/// An application-owned persistence boundary for host-driven execution.
+///
+/// The execution invokes this sink after each durable node transition. The
+/// sink decides where and how snapshots are stored; the behavior-tree runtime
+/// never owns application persistence.
+public struct BehaviorCheckpointSink: Sendable {
+  private let saveSnapshot: @Sendable (BehaviorExecutionSnapshot) async throws -> Void
+
+  /// Creates a checkpoint sink from an asynchronous persistence operation.
+  public init(
+    _ saveSnapshot:
+      @escaping @Sendable (BehaviorExecutionSnapshot) async throws -> Void
+  ) {
+    self.saveSnapshot = saveSnapshot
+  }
+
+  func save(_ snapshot: BehaviorExecutionSnapshot) async throws {
+    try await saveSnapshot(snapshot)
   }
 }

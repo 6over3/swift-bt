@@ -84,6 +84,9 @@ extension BehaviorTree where Action: Sendable, Condition: Sendable {
         } catch is CancellationError {
           await session?.emit(.executionCancelled)
           throw CancellationError()
+        } catch let error as BehaviorExecutionError {
+          await session?.emit(.executionFailed, diagnostic: error.diagnostic)
+          throw error
         } catch {
           await session?.emit(.executionFailed)
           throw error
@@ -124,9 +127,24 @@ extension BehaviorTree where Action: Sendable, Condition: Sendable {
       await session?.emit(.nodeCancelled, nodeID: nodeID)
       throw CancellationError()
     } catch let error as BehaviorExecutionError {
+      if error.nodeID == nodeID {
+        await session?.emit(
+          .nodeFailed,
+          nodeID: nodeID,
+          outcome: .failed,
+          diagnostic: error.diagnostic
+        )
+      }
       throw error
     } catch {
-      throw BehaviorExecutionError(nodeID: nodeID, underlyingError: error)
+      let executionError = BehaviorExecutionError(nodeID: nodeID, underlyingError: error)
+      await session?.emit(
+        .nodeFailed,
+        nodeID: nodeID,
+        outcome: .failed,
+        diagnostic: executionError.diagnostic
+      )
+      throw executionError
     }
   }
 
@@ -141,7 +159,7 @@ extension BehaviorTree where Action: Sendable, Condition: Sendable {
     let node = plan.nodes[index]
     switch node.operation {
     case .action(let action):
-      let reporter = BehaviorReporter { report in
+      let reporter = BehaviorReporter(nodeID: node.id) { report in
         switch report {
         case .progress(let progress):
           await session?.emit(.nodeProgress, nodeID: node.id, progress: progress)
@@ -154,8 +172,11 @@ extension BehaviorTree where Action: Sendable, Condition: Sendable {
         }
       }
       let result = try await executor.perform(action, in: context, reporting: reporter)
+      guard let outcome = result.outcome else {
+        throw BehaviorRuntimeError.runningActionRequiresHostDrivenExecution
+      }
       return RuntimeNodeResult(
-        outcome: result.outcome,
+        outcome: outcome,
         diagnostic: result.diagnostic,
         skipped: false
       )
@@ -185,6 +206,20 @@ extension BehaviorTree where Action: Sendable, Condition: Sendable {
         session: session,
         honorCancellation: honorCancellation
       )
+
+    case .dynamicSubtrees:
+      for child in node.children {
+        let result = try await execute(
+          at: child,
+          in: context,
+          using: executor,
+          session: session,
+          honorCancellation: honorCancellation
+        )
+        if result.skipped { continue }
+        if result.outcome == .failed { return result }
+      }
+      return .succeeded
 
     case .sequence(let memory):
       if memory == .reactive {

@@ -1,6 +1,15 @@
 {
-  "originHash" : "5f55f071ff8c876a77fcf26a7c1aec06c8554d862caec9f87a85c7df7dc51f51",
+  "originHash" : "c40bbaede7a8482f9029bbcb288f80183bad04518dfddfccb91ee59c8d5dc3b8",
   "pins" : [
+    {
+      "identity" : "elk-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/lukilabs/elk-swift.git",
+      "state" : {
+        "revision" : "32f8042e3509a4819f00ff9cd46e829ec2b26da0",
+        "version" : "1.0.2"
+      }
+    },
     {
       "identity" : "swift-distributed-tracing",
       "kind" : "remoteSourceControl",
