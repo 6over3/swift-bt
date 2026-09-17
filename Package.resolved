@@ -1,5 +1,5 @@
 {
-  "originHash" : "c40bbaede7a8482f9029bbcb288f80183bad04518dfddfccb91ee59c8d5dc3b8",
+  "originHash" : "4b968418b6c40292facedce3a884dffc9d2a30591f4ac47fa2a7e33b563c4c56",
   "pins" : [
     {
       "identity" : "elk-swift",
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-log.git",
       "state" : {
-        "revision" : "3ffafb9722d5d918c614feb496c8789a3b59d222",
-        "version" : "1.15.0"
+        "revision" : "9c6fb14227f55d8f711ce3847dc2f419fb0ecacb",
+        "version" : "1.15.1"
       }
     },
     {
